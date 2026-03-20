@@ -11,6 +11,4 @@
 
 如何安装？
 
-在你网站plugin路径下新建 cloudflare-imagebed 文件夹 👉 在cloudflare-imagebed 文件夹 中新建一个 cf_imgbed.php 文件
-
-填入本项目中cf_imgbed.php的代码即可
+下载releases中最新的zip包，在wordpress后台安装插件即可
