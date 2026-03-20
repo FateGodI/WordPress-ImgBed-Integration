@@ -3,7 +3,7 @@
  * Plugin Name: Cloudflare ImgBed Integration
  * Plugin URI:  https://github.com/FateGodI/WordPress-ImgBed-Integration
  * Description: 将图片同步到 Cloudflare ImgBed，提供三种本地文件保留策略，完美兼容子比主题。
- * Version:     2.0.1
+ * Version:     2.1.0
  * Author:      zkeeolo
  * Author URI:  https://github.com/FateGodI/
  * License:     MIT
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'CF_IMGBED_VERSION', '2.0.0' );
+define( 'CF_IMGBED_VERSION', '2.1.0' );
 define( 'CF_IMGBED_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'CF_IMGBED_PLUGIN_PATH', plugin_dir_path( __FILE__ ) );
 
@@ -53,6 +53,9 @@ class CF_ImgBed_Integration {
         add_filter( 'wp_get_attachment_image_src', array( $this, 'replace_attachment_image_src' ), 10, 4 );
         add_filter( 'the_content', array( $this, 'replace_content_image_urls' ) );
 
+        // 重要：替换媒体库（后台）中的图片 URL，确保预览可见
+        add_filter( 'wp_prepare_attachment_for_js', array( $this, 'prepare_attachment_for_js' ), 10, 3 );
+
         // 前端上传短代码
         add_shortcode( 'cf_upload_form', array( $this, 'render_upload_form' ) );
         add_action( 'wp_ajax_cf_imgbed_upload', array( $this, 'ajax_upload_handler' ) );
@@ -74,7 +77,7 @@ class CF_ImgBed_Integration {
             'return_format'         => 'full',
             'upload_name_type'      => 'default',
             'auto_retry'            => 'yes',
-            'replace_url'           => 'yes',          // 默认启用URL替换
+            'replace_url'           => 'yes',          // 默认启用URL替换 一般情况不需要修改！
             'local_strategy'        => self::STRATEGY_KEEP_ALL,
         );
         foreach ( $defaults as $key => $value ) {
@@ -245,10 +248,10 @@ class CF_ImgBed_Integration {
     }
 
     /**
-     * 根据策略删除本地文件
+     * 根据策略删除本地文件（鉴于2.0.1不执行重新修改）
      *
      * @param int    $attachment_id
-     * @param string $original_path
+     * @param string $original_path  get_attached_file() 返回的完整路径
      * @param string $strategy
      */
     private function delete_local_files_by_strategy( $attachment_id, $original_path, $strategy ) {
@@ -256,36 +259,74 @@ class CF_ImgBed_Integration {
             return; // 不删除任何文件
         }
 
+        // 获取附件元数据（用于缩略图）
         $metadata = wp_get_attachment_metadata( $attachment_id );
-        $upload_dir = wp_upload_dir();
-        $basedir = $upload_dir['basedir'];
-        $file = $metadata['file'] ?? ''; // 相对路径，如 2024/01/image.jpg
+        if ( empty( $metadata ) ) {
+            // 若元数据缺失，只尝试删除原图
+            $this->maybe_delete_file( $original_path );
+            return;
+        }
+
+        // 原图直接使用传入的路径，避免重复构建
+        $original_file = $original_path;
 
         if ( $strategy === self::STRATEGY_KEEP_THUMBS ) {
             // 仅删除原图，保留所有缩略图
-            $full_original = trailingslashit( $basedir ) . $file;
-            if ( file_exists( $full_original ) && $full_original === $original_path ) {
-                wp_delete_file( $full_original );
-                update_post_meta( $attachment_id, '_cf_imgbed_original_deleted', 'yes' );
+            if ( file_exists( $original_file ) ) {
+                $deleted = $this->maybe_delete_file( $original_file );
+                if ( $deleted ) {
+                    update_post_meta( $attachment_id, '_cf_imgbed_original_deleted', 'yes' );
+                } else {
+                    error_log( "CF ImgBed: 原图删除失败 (ID {$attachment_id})：{$original_file}" );
+                }
             }
         } elseif ( $strategy === self::STRATEGY_CLOUD_ONLY ) {
             // 删除原图
-            $full_original = trailingslashit( $basedir ) . $file;
-            if ( file_exists( $full_original ) ) {
-                wp_delete_file( $full_original );
+            $original_deleted = false;
+            if ( file_exists( $original_file ) ) {
+                $original_deleted = $this->maybe_delete_file( $original_file );
+                if ( ! $original_deleted ) {
+                    error_log( "CF ImgBed: 原图删除失败 (ID {$attachment_id})：{$original_file}" );
+                }
             }
+
             // 删除所有缩略图
-            if ( ! empty( $metadata['sizes'] ) ) {
-                $dir = trailingslashit( dirname( $full_original ) );
-                foreach ( $metadata['sizes'] as $size ) {
-                    $thumb_path = $dir . $size['file'];
-                    if ( file_exists( $thumb_path ) ) {
-                        wp_delete_file( $thumb_path );
+            $thumb_deleted_count = 0;
+            if ( ! empty( $metadata['sizes'] ) && is_array( $metadata['sizes'] ) ) {
+                $dir = trailingslashit( dirname( $original_file ) );
+                foreach ( $metadata['sizes'] as $size_name => $size_data ) {
+                    if ( ! empty( $size_data['file'] ) ) {
+                        $thumb_path = $dir . $size_data['file'];
+                        if ( file_exists( $thumb_path ) ) {
+                            if ( $this->maybe_delete_file( $thumb_path ) ) {
+                                $thumb_deleted_count++;
+                            } else {
+                                error_log( "CF ImgBed: 缩略图删除失败 (ID {$attachment_id}, 尺寸 {$size_name})：{$thumb_path}" );
+                            }
+                        }
                     }
                 }
             }
-            update_post_meta( $attachment_id, '_cf_imgbed_all_deleted', 'yes' );
+
+            // 只要删除了原图或至少一张缩略图，就记录云端标记
+            if ( $original_deleted || $thumb_deleted_count > 0 ) {
+                update_post_meta( $attachment_id, '_cf_imgbed_all_deleted', 'yes' );
+            }
         }
+    }
+
+    /**
+     * 安全删除文件，返回是否成功
+     *
+     * @param string $file_path
+     * @return bool
+     */
+    private function maybe_delete_file( $file_path ) {
+        if ( ! file_exists( $file_path ) ) {
+            return true; // 文件已不存在，视为成功
+        }
+        // wp_delete_file 返回 true/false 取决于 unlink 是否成功
+        return wp_delete_file( $file_path );
     }
 
     /**
@@ -428,6 +469,44 @@ class CF_ImgBed_Integration {
             }
         }
         return $matches[0];
+    }
+
+    /**
+     * 替换媒体库（后台）中的图片 URL，确保预览可见（旧版有奇奇怪怪问题）
+     *
+     * @param array   $response  准备返回给媒体库的数据
+     * @param WP_Post $post      附件对象
+     * @param array   $meta      附件元数据
+     * @return array
+     */
+    public function prepare_attachment_for_js( $response, $post, $meta ) {
+        if ( get_option( 'cf_imgbed_replace_url' ) !== 'yes' ) {
+            return $response;
+        }
+
+        $cf_url = get_post_meta( $post->ID, '_cf_imgbed_url', true );
+        if ( empty( $cf_url ) ) {
+            return $response;
+        }
+
+        // 替换主 URL
+        $response['url'] = $cf_url;
+
+        // 替换所有尺寸的 URL（如缩略图、中等、大图等）
+        if ( isset( $response['sizes'] ) && is_array( $response['sizes'] ) ) {
+            foreach ( $response['sizes'] as $size_name => &$size_data ) {
+                if ( isset( $size_data['url'] ) ) {
+                    $size_data['url'] = $cf_url;
+                }
+            }
+        }
+
+        // 替换图标 URL（如果有）
+        if ( isset( $response['icon'] ) ) {
+            $response['icon'] = $cf_url;
+        }
+
+        return $response;
     }
 
     /**
